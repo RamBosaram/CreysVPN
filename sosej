@@ -1,0 +1,70 @@
+export default {
+  async fetch(request) {
+    try {
+      if (request.method !== "POST") {
+        return new Response("Only POST", { status: 405 });
+      }
+
+      const body = await request.json();
+      const key = body.key?.toUpperCase();
+      const device_id = body.device_id;
+
+      if (!key) {
+        return json({ success: false, error: "NO_KEY" });
+      }
+
+      const FIREBASE_URL = "https://creysvpn-default-rtdb.europe-west1.firebasedatabase.app/keys/" + key + ".json";
+
+      const res = await fetch(FIREBASE_URL);
+      const data = await res.json();
+
+      if (!data) {
+        return json({ success: false, error: "NOT_FOUND" });
+      }
+
+      const now = Date.now();
+
+      if (data.activated && data.device_id && data.device_id !== device_id) {
+        return json({ success: false, error: "USED" });
+      }
+
+      let expires = data.expires_at || 0;
+
+      if (!data.activated) {
+        let duration = 1;
+
+        if (data.type === "week") duration = 7;
+        if (data.type === "month") duration = 30;
+
+        expires = now + duration * 24 * 60 * 60 * 1000;
+
+        await fetch(FIREBASE_URL, {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            activated: true,
+            device_id: device_id,
+            expires_at: expires
+          })
+        });
+      }
+
+      if (expires < now) {
+        return json({ success: false, error: "EXPIRED" });
+      }
+
+      return json({ success: true, expires_at: expires });
+
+    } catch (e) {
+      return json({ success: false, error: "SERVER_ERROR" });
+    }
+  }
+};
+
+function json(data) {
+  return new Response(JSON.stringify(data), {
+    headers: { "Content-Type": "application/json" }
+  });
+}
