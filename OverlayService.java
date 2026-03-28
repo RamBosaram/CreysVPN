@@ -8,11 +8,6 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.graphics.PixelFormat;
-import android.animation.Animator;
-import android.animation.AnimatorListenerAdapter;
-import android.animation.AnimatorSet;
-import android.animation.ObjectAnimator;
-import android.view.animation.DecelerateInterpolator;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
@@ -25,9 +20,12 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.TextView;
 
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+// OkHttp — как у конкурентов
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 import java.nio.charset.StandardCharsets;
 
 import javax.crypto.Mac;
@@ -36,8 +34,6 @@ import javax.crypto.spec.SecretKeySpec;
 public class OverlayService extends Service {
 
     private static final String TAG = "OverlayService";
-    private boolean isIpViewAdded = false;
-    private boolean isIpShown = false;
     private static final String PREFS_NAME = "creysvpn_prefs";
     private static final String KEY_COOLDOWN_TIME = "cooldown_time";
 
@@ -48,18 +44,13 @@ public class OverlayService extends Service {
     private WindowManager.LayoutParams overlayRootParams;
 
     private View overlayIpView;
-    private TextView tvOverlayIP;
+    private TextView tvIpPort; // новый id
 
     private View overlayBanner;
-
-    private View overlayNotification;
-    private TextView tvNotification;
-
-    private View overlayStatus;
-    private TextView tvStatusText;
-
-    private View overlayTimer;
-    private TextView tvTimer;
+    // Три отдельных уведомления
+    private View overlayNotifSend;
+    private View overlayNotifComp;
+    private View overlayNotifError;
 
     private String latestIp = null;
     private int latestPort = 0;
@@ -70,12 +61,11 @@ public class OverlayService extends Service {
     private Handler handler = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
 
-    private final BroadcastReceiver ipFoundReceiver = new BroadcastReceiver() {
+    private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
 
-            // Скрываем IP когда игра закрыта
             if (PcapVpnService.ACTION_IP_LOST.equals(action)) {
                 hideIpPort();
                 return;
@@ -91,7 +81,6 @@ public class OverlayService extends Service {
                         latestIp = parts[0];
                         latestPort = Integer.parseInt(parts[1]);
                         isSupercellServer = isSupercell;
-
                         showIpPort(latestIp + ":" + latestPort);
                         updateGoButtonAppearance();
                     }
@@ -101,9 +90,7 @@ public class OverlayService extends Service {
     };
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 
     @Override
     public void onCreate() {
@@ -111,25 +98,23 @@ public class OverlayService extends Service {
 
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         cooldownEndTime = prefs.getLong(KEY_COOLDOWN_TIME, 0);
-
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
         createOverlayButton();
         createOverlayIp();
         createOverlayBanner();
-        createOverlayNotification();
-        createOverlayStatus();
-        createOverlayTimer();
+        createOverlayNotifSend();
+        createOverlayNotifComp();
+        createOverlayNotifError();
 
-        // Регистрируем оба action
         IntentFilter filter = new IntentFilter();
         filter.addAction(PcapVpnService.ACTION_IP_FOUND);
         filter.addAction(PcapVpnService.ACTION_IP_LOST);
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(ipFoundReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
         } else {
-            registerReceiver(ipFoundReceiver, filter);
+            registerReceiver(receiver, filter);
         }
 
         checkCooldown();
@@ -170,7 +155,6 @@ public class OverlayService extends Service {
                         initialTouchY = event.getRawY();
                         moved = false;
                         return true;
-
                     case MotionEvent.ACTION_MOVE:
                         int dx = (int)(event.getRawX() - initialTouchX);
                         int dy = (int)(event.getRawY() - initialTouchY);
@@ -179,7 +163,6 @@ public class OverlayService extends Service {
                         overlayRootParams.y = initialY + dy;
                         windowManager.updateViewLayout(overlayRoot, overlayRootParams);
                         return true;
-
                     case MotionEvent.ACTION_UP:
                         if (!moved) onButtonClicked();
                         return true;
@@ -193,7 +176,7 @@ public class OverlayService extends Service {
 
     private void createOverlayIp() {
         overlayIpView = LayoutInflater.from(this).inflate(R.layout.overlay_ip, null);
-        tvOverlayIP = overlayIpView.findViewById(R.id.tvIpPort);
+        tvIpPort = overlayIpView.findViewById(R.id.tvIpPort); // новый id
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -209,11 +192,11 @@ public class OverlayService extends Service {
 
         windowManager.addView(overlayIpView, params);
         overlayIpView.setVisibility(View.GONE);
+        overlayIpView.setAlpha(0f);
     }
 
     private void createOverlayBanner() {
         overlayBanner = LayoutInflater.from(this).inflate(R.layout.overlay_banner, null);
-
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -221,17 +204,13 @@ public class OverlayService extends Service {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
         );
-
         params.gravity = Gravity.CENTER_HORIZONTAL | Gravity.TOP;
         params.y = 50;
-
         windowManager.addView(overlayBanner, params);
     }
 
-    private void createOverlayNotification() {
-        overlayNotification = LayoutInflater.from(this).inflate(R.layout.overlay_notification, null);
-        tvNotification = overlayNotification.findViewById(R.id.tvNotification);
-
+    private void createOverlayNotifSend() {
+        overlayNotifSend = LayoutInflater.from(this).inflate(R.layout.overlay_status, null);
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -239,56 +218,131 @@ public class OverlayService extends Service {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
         );
-
-        params.gravity = Gravity.CENTER;
-
-        windowManager.addView(overlayNotification, params);
-        overlayNotification.setVisibility(View.GONE);
-    }
-
-    private void createOverlayStatus() {
-        overlayStatus = LayoutInflater.from(this).inflate(R.layout.overlay_status, null);
-        tvStatusText = overlayStatus.findViewById(R.id.tvStatusText);
-
-        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                PixelFormat.TRANSLUCENT
-        );
-
-        params.gravity = Gravity.CENTER_HORIZONTAL | Gravity.BOTTOM;
-        params.y = 200;
-
-        windowManager.addView(overlayStatus, params);
-        overlayStatus.setVisibility(View.GONE);
-    }
-
-    private void createOverlayTimer() {
-        overlayTimer = LayoutInflater.from(this).inflate(R.layout.overlay_timer, null);
-        tvTimer = overlayTimer.findViewById(R.id.tvTimer);
-
-        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                PixelFormat.TRANSLUCENT
-        );
-
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = 50;
-        params.y = 400;
+        params.y = 500;
+        windowManager.addView(overlayNotifSend, params);
+        overlayNotifSend.setVisibility(View.GONE);
+        overlayNotifSend.setAlpha(0f);
+    }
 
-        windowManager.addView(overlayTimer, params);
-        overlayTimer.setVisibility(View.GONE);
+    private void createOverlayNotifComp() {
+        overlayNotifComp = LayoutInflater.from(this).inflate(R.layout.overlay_notification_comp, null);
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.TOP | Gravity.END;
+        params.x = 50;
+        params.y = 500;
+        windowManager.addView(overlayNotifComp, params);
+        overlayNotifComp.setVisibility(View.GONE);
+        overlayNotifComp.setAlpha(0f);
+    }
+
+    private void createOverlayNotifError() {
+        overlayNotifError = LayoutInflater.from(this).inflate(R.layout.overlay_notification_error, null);
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+        );
+        params.gravity = Gravity.TOP | Gravity.END;
+        params.x = 50;
+        params.y = 500;
+        windowManager.addView(overlayNotifError, params);
+        overlayNotifError.setVisibility(View.GONE);
+        overlayNotifError.setAlpha(0f);
+    }
+
+    // Показать уведомление с анимацией, скрыть через delayMs
+    private void showNotifView(View view, long delayMs) {
+        // Скрываем остальные
+        hideNotifView(overlayNotifSend);
+        hideNotifView(overlayNotifComp);
+        hideNotifView(overlayNotifError);
+
+        view.setVisibility(View.VISIBLE);
+        view.setAlpha(0f);
+        view.setScaleX(0.8f);
+        view.setScaleY(0.8f);
+        view.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(250).start();
+
+        handler.postDelayed(() -> hideNotifView(view), delayMs);
+    }
+
+    private void hideNotifView(View view) {
+        if (view == null || view.getVisibility() == View.GONE) return;
+        view.animate().alpha(0f).scaleX(0.8f).scaleY(0.8f).setDuration(250)
+                .withEndAction(() -> {
+                    view.setVisibility(View.GONE);
+                    view.setScaleX(1f);
+                    view.setScaleY(1f);
+                }).start();
+    }
+
+    // Появление с анимацией — плавно справа + прозрачность 0→1
+    private static final long HIDE_TIMEOUT = 3000;
+
+    private final Runnable clearIpRunnable = () -> hideIpPort();
+
+    private void showIpPort(String ipPort) {
+        if (tvIpPort == null) return;
+
+        // Сбрасываем таймер скрытия — точно как у конкурентов
+        handler.removeCallbacks(clearIpRunnable);
+        handler.postDelayed(clearIpRunnable, HIDE_TIMEOUT);
+
+        if (overlayIpView.getVisibility() == View.VISIBLE && overlayIpView.getAlpha() >= 1f) {
+            // Уже видно — просто обновляем текст без анимации
+            tvIpPort.setText(ipPort);
+            return;
+        }
+
+        // Окошко скрыто — показываем с анимацией
+        tvIpPort.setText(ipPort);
+        overlayIpView.setVisibility(View.VISIBLE);
+        overlayIpView.setAlpha(0f);
+        overlayIpView.setScaleX(0.8f);
+        overlayIpView.setScaleY(0.8f);
+        overlayIpView.animate()
+                .alpha(1f)
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(300)
+                .start();
+    }
+
+    // Исчезновение с анимацией — плавно вправо + прозрачность 1→0
+    private void hideIpPort() {
+        if (overlayIpView == null || overlayIpView.getVisibility() == View.GONE) return;
+
+        overlayIpView.animate()
+                .alpha(0f)
+                .scaleX(0.8f)
+                .scaleY(0.8f)
+                .setDuration(300)
+                .withEndAction(() -> {
+                    overlayIpView.setVisibility(View.GONE);
+                    overlayIpView.setScaleX(1f);
+                    overlayIpView.setScaleY(1f);
+                })
+                .start();
+
+        latestIp = null;
+        latestPort = 0;
+        isSupercellServer = false;
+        updateGoButtonAppearance();
     }
 
     private void updateGoButtonAppearance() {
         if (overlayRoot == null) return;
         if (!isButtonEnabled) return;
-
         if (isSupercellServer) {
             overlayRoot.setEnabled(true);
             overlayRoot.setAlpha(1.0f);
@@ -302,98 +356,146 @@ public class OverlayService extends Service {
         if (!isButtonEnabled) {
             long remaining = (cooldownEndTime - System.currentTimeMillis()) / 1000;
             if (remaining > 0) {
-                long minutes = remaining / 60;
-                long seconds = remaining % 60;
-                showNotification(String.format("Жди %d:%02d", minutes, seconds));
+                showNotifView(overlayNotifError, 2500);
             }
             return;
         }
-
-        if (!isSupercellServer) {
-            showNotification("Не Supercell сервер");
-            return;
-        }
-
-        if (latestIp == null || latestPort == 0) {
-            showNotification("IP не найден!");
-            return;
-        }
-
-        sendCrashRequest(latestIp, latestPort);
+        if (!isSupercellServer) { showNotifView(overlayNotifError, 2500); return; }
+        if (latestIp == null || latestPort == 0) { showNotifView(overlayNotifError, 2500); return; }
+        sendRequest(latestIp, latestPort);
     }
 
-    private void sendCrashRequest(final String ip, final int port) {
-        showNotification("Send...");
-        overlayRoot.setEnabled(false);
+//    private void sendRequest(final String ip, final int port) {
+//        // Показываем send без таймера — скроем вручную когда придёт ответ
+//        hideNotifView(overlayNotifSend);
+//        hideNotifView(overlayNotifComp);
+//        hideNotifView(overlayNotifError);
+//        overlayNotifSend.setVisibility(View.VISIBLE);
+//        overlayNotifSend.setAlpha(0f);
+//        overlayNotifSend.setScaleX(0.8f);
+//        overlayNotifSend.setScaleY(0.8f);
+//        overlayNotifSend.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(250).start();
+//        overlayRoot.setEnabled(false);
+//
+//        new Thread(() -> {
+//            try {
+//                OkHttpClient client = new OkHttpClient.Builder()
+//                        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+//                        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+//                        .build();
+//
+//                String deviceId = getUniqueDeviceId();
+//                String deviceHash = generateDeviceHash();
+//                long timestamp = System.currentTimeMillis() / 1000;
+//                String nonce = java.util.UUID.randomUUID().toString();
+//                Log.d("CreysVPN_VPS", "Sending: ts=" + timestamp + " nonce=" + nonce);
+//                String signatureData = deviceId + timestamp + nonce + deviceHash;
+//                String signature = generateHmacSignature(signatureData);
+//
+//                org.json.JSONObject json = new org.json.JSONObject();
+//                json.put("device_id", deviceId);
+//                json.put("device_hash", deviceHash);
+//                json.put("ip", ip);
+//                json.put("port", String.valueOf(port));
+//                json.put("v", Config.APP_VERSION);
+//                json.put("timestamp", timestamp);
+//                json.put("signature", signature);
+//                json.put("nonce", nonce);
+//
+//                RequestBody body = RequestBody.create(
+//                        MediaType.get("application/json"),
+//                        json.toString());
+//
+//                Request request = new Request.Builder()
+//                        .url(Config.VPS_URL + "/proxy")
+//                        .post(body)
+//                        .addHeader("Content-Type", "application/json")
+//                        .addHeader("User-Agent", "Android-App-v3")
+//                        .build();
+//
+//                Response response = client.newCall(request).execute();
+//                final boolean success = response.isSuccessful();
+//                String responseBody = response.body() != null ? response.body().string() : "empty";
+//                Log.d("CreysVPN_VPS", "Code: " + response.code() + " Body: " + responseBody);
+//
+//                handler.post(() -> {
+//                    if (success) { hideNotifView(overlayNotifSend); showNotifView(overlayNotifComp, 2500); startCooldown(); }
+//                    else { hideNotifView(overlayNotifSend); showNotifView(overlayNotifError, 2500); updateGoButtonAppearance(); }
+//                });
+//            } catch (Exception e) {
+//                handler.post(() -> { hideNotifView(overlayNotifSend); showNotifView(overlayNotifError, 2500); updateGoButtonAppearance(); });
+//            }
+//        }).start();
+//    }
+private void sendRequest(final String ip, final int port) {
+    hideNotifView(overlayNotifSend);
+    hideNotifView(overlayNotifComp);
+    hideNotifView(overlayNotifError);
+    overlayNotifSend.setVisibility(View.VISIBLE);
+    overlayNotifSend.setAlpha(0f);
+    overlayNotifSend.setScaleX(0.8f);
+    overlayNotifSend.setScaleY(0.8f);
+    overlayNotifSend.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(250).start();
+    overlayRoot.setEnabled(false);
 
-        new Thread(() -> {
-            try {
-                String deviceId = DeviceIdGenerator.getDeviceId(OverlayService.this);
-                long timestamp = System.currentTimeMillis() / 1000;
-                String dataToSign = deviceId + ip + port + timestamp;
-                String signature = generateHmacSignature(dataToSign);
+    new Thread(() -> {
+        try {
+            OkHttpClient client = new OkHttpClient.Builder()
+                    .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                    .build();
 
-                String jsonPayload = String.format(
-                        "{\"device_id\":\"%s\",\"ip\":\"%s\",\"port\":%d,\"timestamp\":%d,\"signature\":\"%s\",\"version\":\"%s\"}",
-                        deviceId, ip, port, timestamp, signature, Config.APP_VERSION
-                );
+            org.json.JSONObject json = new org.json.JSONObject();
+            json.put("ip", ip);
+            json.put("port", port);          // int, не String
+            json.put("time", Config.REPORT_TIME);
 
-                URL url = new URL(Config.VPS_URL);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(10000);
-                conn.setReadTimeout(10000);
+            RequestBody body = RequestBody.create(
+                    MediaType.get("application/json"),
+                    json.toString());
 
-                OutputStream os = conn.getOutputStream();
-                os.write(jsonPayload.getBytes(StandardCharsets.UTF_8));
-                os.flush();
-                os.close();
+            Request request = new Request.Builder()
+                    .url(Config.CLOUDFLARE_URL)
+                    .post(body)
+                    .addHeader("Content-Type", "application/json")
+                    .build();
 
-                int responseCode = conn.getResponseCode();
-                final boolean success = (responseCode >= 200 && responseCode < 300);
+            Response response = client.newCall(request).execute();
+            final boolean success = response.isSuccessful();
+            String responseBody = response.body() != null ? response.body().string() : "empty";
+            Log.d(TAG, "Cloudflare: " + response.code() + " | " + responseBody);
 
-                handler.post(() -> {
-                    if (success) {
-                        showNotification("Успешно!");
-                        startCooldown();
-                    } else {
-                        showNotification("Ошибка отправки!");
-                        updateGoButtonAppearance();
-                    }
-                });
-
-            } catch (final Exception e) {
-                Log.e(TAG, "❌ Error: " + e.getMessage(), e);
-                handler.post(() -> {
-                    showNotification("Ошибка отправки!");
+            handler.post(() -> {
+                if (success) {
+                    hideNotifView(overlayNotifSend);
+                    showNotifView(overlayNotifComp, 2500);
+                    startCooldown();
+                } else {
+                    hideNotifView(overlayNotifSend);
+                    showNotifView(overlayNotifError, 2500);
                     updateGoButtonAppearance();
-                });
-            }
-        }).start();
-    }
+                }
+            });
 
+        } catch (Exception e) {
+            Log.e(TAG, "Request failed: " + e.getMessage());
+            handler.post(() -> {
+                hideNotifView(overlayNotifSend);
+                showNotifView(overlayNotifError, 2500);
+                updateGoButtonAppearance();
+            });
+        }
+    }).start();
+}
     private String generateHmacSignature(String data) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
-            SecretKeySpec secretKeySpec = new SecretKeySpec(
-                    Config.getSecretKey().getBytes(StandardCharsets.UTF_8),
-                    "HmacSHA256"
-            );
-            mac.init(secretKeySpec);
+            mac.init(new SecretKeySpec(Config.getSecretKey().getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             byte[] hash = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : hash) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) hexString.append('0');
-                hexString.append(hex);
-            }
-            return hexString.toString();
-        } catch (Exception e) {
-            Log.e(TAG, "Error HMAC: " + e.getMessage());
-            return "";
-        }
+            StringBuilder sb = new StringBuilder();
+            for (byte b : hash) { String h = Integer.toHexString(0xff & b); if (h.length() == 1) sb.append('0'); sb.append(h); }
+            return sb.toString();
+        } catch (Exception e) { return ""; }
     }
 
     private void startCooldown() {
@@ -405,8 +507,7 @@ public class OverlayService extends Service {
     }
 
     private void checkCooldown() {
-        long now = System.currentTimeMillis();
-        if (now < cooldownEndTime) {
+        if (System.currentTimeMillis() < cooldownEndTime) {
             isButtonEnabled = false;
             updateButtonState();
             handler.postDelayed(this::checkCooldown, 1000);
@@ -424,70 +525,62 @@ public class OverlayService extends Service {
             hideTimer();
         } else {
             long remaining = (cooldownEndTime - System.currentTimeMillis()) / 1000;
-            if (remaining > 0) {
-                long minutes = remaining / 60;
-                long seconds = remaining % 60;
-                showTimer(String.format("%d:%02d", minutes, seconds));
-            }
+            if (remaining > 0) showTimer(String.format("%d:%02d", remaining / 60, remaining % 60));
             overlayRoot.setEnabled(false);
             overlayRoot.setAlpha(0.5f);
         }
     }
 
-    private void showIpPort(String ipPort) {
-        if (tvOverlayIP != null) {
-            tvOverlayIP.setText(ipPort);
-            overlayIpView.setVisibility(View.VISIBLE);
+
+
+    private void showTimer(String time) { /* таймер убран */ }
+    private void hideTimer() { /* таймер убран */ }
+
+
+    private String getUniqueDeviceId() {
+        SharedPreferences p = getSharedPreferences("app_prefs", MODE_PRIVATE);
+        String deviceId = p.getString("device_id", null);
+        if (deviceId != null && !deviceId.isEmpty()) return deviceId;
+        deviceId = generateDeviceHash();
+        p.edit().putString("device_id", deviceId).apply();
+        return deviceId;
+    }
+
+    private String generateDeviceHash() {
+        try {
+            String androidId = android.provider.Settings.Secure.getString(getContentResolver(), "android_id");
+            if (androidId == null) androidId = "unknown";
+            String data = androidId
+                    + android.os.Build.MANUFACTURER + android.os.Build.MODEL
+                    + android.os.Build.SERIAL + android.os.Build.FINGERPRINT
+                    + android.os.Build.BOARD + android.os.Build.BRAND
+                    + android.os.Build.DEVICE + android.os.Build.DISPLAY
+                    + android.os.Build.HOST + android.os.Build.ID
+                    + android.os.Build.PRODUCT + android.os.Build.TAGS
+                    + android.os.Build.TYPE + android.os.Build.USER
+                    + android.os.Build.TIME;
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] bytes = md.digest(data.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : bytes) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return "unknown";
         }
     }
-
-    private void hideIpPort() {
-        if (overlayIpView != null) {
-            overlayIpView.setVisibility(View.GONE);
-        }
-        latestIp = null;
-        latestPort = 0;
-        isSupercellServer = false;
-        updateGoButtonAppearance();
-    }
-
-    private void showNotification(String text) {
-        if (tvNotification != null) {
-            tvNotification.setText(text);
-            overlayNotification.setVisibility(View.VISIBLE);
-            handler.removeCallbacks(hideNotificationRunnable);
-            handler.postDelayed(hideNotificationRunnable, 3000);
-        }
-    }
-
-    private final Runnable hideNotificationRunnable = () -> {
-        if (overlayNotification != null) overlayNotification.setVisibility(View.GONE);
-    };
-
-    private void showTimer(String time) {
-        if (tvTimer != null) {
-            tvTimer.setText(time);
-            overlayTimer.setVisibility(View.VISIBLE);
-        }
-    }
-
-    private void hideTimer() {
-        if (overlayTimer != null) overlayTimer.setVisibility(View.GONE);
-    }
-
     @Override
     public void onDestroy() {
         super.onDestroy();
-        try { unregisterReceiver(ipFoundReceiver); } catch (Exception ignored) {}
+        try { unregisterReceiver(receiver); } catch (Exception ignored) {}
         handler.removeCallbacksAndMessages(null);
         if (windowManager != null) {
             try {
                 if (overlayRoot != null) windowManager.removeView(overlayRoot);
                 if (overlayIpView != null) windowManager.removeView(overlayIpView);
                 if (overlayBanner != null) windowManager.removeView(overlayBanner);
-                if (overlayNotification != null) windowManager.removeView(overlayNotification);
-                if (overlayStatus != null) windowManager.removeView(overlayStatus);
-                if (overlayTimer != null) windowManager.removeView(overlayTimer);
+                if (overlayNotifSend != null) windowManager.removeView(overlayNotifSend);
+                if (overlayNotifComp != null) windowManager.removeView(overlayNotifComp);
+                if (overlayNotifError != null) windowManager.removeView(overlayNotifError);
             } catch (Exception ignored) {}
         }
         Log.i(TAG, "🛑 OverlayService stopped");
